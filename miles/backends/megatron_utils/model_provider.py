@@ -23,6 +23,51 @@ from miles.utils.replay_base import routing_replay_manager
 logger = logging.getLogger(__name__)
 
 
+def _get_megatron_peft_cls(args):
+    """Create Megatron Bridge PEFT class instance (mirrors verl's get_peft_cls)."""
+    from miles.utils.lora_utils import get_megatron_lora_config
+
+    lora_config = get_megatron_lora_config(args)
+    lora_type = lora_config.get("type", "lora")
+
+    try:
+        if lora_type == "lora":
+            from megatron.bridge.peft.lora import LoRA
+
+            return LoRA(
+                target_modules=lora_config["target_modules"],
+                dim=lora_config["rank"],
+                alpha=lora_config["alpha"],
+                dropout=lora_config.get("dropout", 0.0),
+                lora_A_init_method=lora_config.get("lora_A_init_method", "kaiming"),
+                lora_B_init_method=lora_config.get("lora_B_init_method", "zero"),
+                exclude_modules=lora_config.get("exclude_modules", []),
+            )
+        elif lora_type == "canonical_lora":
+            from megatron.bridge.peft.canonical_lora import CanonicalLoRA
+
+            return CanonicalLoRA(
+                target_modules=lora_config["target_modules"],
+                dim=lora_config["rank"],
+                alpha=lora_config["alpha"],
+            )
+        elif lora_type == "dora":
+            from megatron.bridge.peft.dora import DoRA
+
+            return DoRA(
+                target_modules=lora_config["target_modules"],
+                dim=lora_config["rank"],
+                alpha=lora_config["alpha"],
+            )
+        else:
+            raise ValueError(f"Unsupported LoRA type: {lora_type}")
+    except ImportError:
+        raise ImportError(
+            "LoRA training with Megatron backend requires megatron-bridge >= 0.2.0 "
+            "with peft support. Install with: pip install megatron-bridge>=0.2.0"
+        )
+
+
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
@@ -93,6 +138,33 @@ def get_model_provider_func(
         provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
         provider.sequence_parallel = args.sequence_parallel
         provider.finalize()
+
+        # Apply LoRA inside the provide function (before DDP/FSDP wrapping).
+        # We wrap provider.provide rather than using register_pre_wrap_hook because
+        # Megatron's get_model() calls provider.provide() directly, bypassing
+        # provide_distributed_model() where hooks are normally invoked.
+        from miles.utils.lora_utils import is_lora_enabled
+
+        if is_lora_enabled(args) and role == "actor":
+            peft_cls = _get_megatron_peft_cls(args)
+            if peft_cls is not None:
+                original_provide = provider.provide
+
+                def provide_with_lora(pre_process=None, post_process=None, vp_stage=None):
+                    model = original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                    # Apply LoRA to the model (freezes base params, adds adapter params)
+                    model = peft_cls(model, training=True)
+                    peft_cls.set_params_to_save(model)
+                    total_params = sum(p.numel() for p in model.parameters())
+                    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                    logger.info(
+                        f"LoRA applied: {trainable_params:,} trainable / "
+                        f"{total_params:,} total ({100 * trainable_params / total_params:.2f}%)"
+                    )
+                    return model
+
+                return provide_with_lora
+
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:

@@ -109,6 +109,22 @@ def setup_model_and_optimizer(
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
+    # LoRA: freeze base model parameters (only LoRA adapter params remain trainable)
+    from miles.utils.lora_utils import is_lora_enabled, is_lora_param
+
+    if is_lora_enabled(args) and role == "actor":
+        # The PEFT class freezes base params during provide_with_lora(). After get_model()
+        # wraps with Float16Module + DDP/FSDP, verify the freeze is still in effect and
+        # apply is_lora_param-based freeze as a safety net (handles different naming conventions).
+        for model_chunk in model:
+            for name, param in model_chunk.named_parameters():
+                if not is_lora_param(name):
+                    param.requires_grad = False
+        # Log trainable param count
+        total = sum(p.numel() for m in model for p in m.parameters())
+        trainable = sum(p.numel() for m in model for p in m.parameters() if p.requires_grad)
+        logger.info(f"LoRA frozen: {trainable:,} trainable / {total:,} total ({100 * trainable / total:.2f}%)")
+
     # Optimizer
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):

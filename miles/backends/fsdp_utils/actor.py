@@ -99,6 +99,19 @@ class FSDPTrainRayActor(TrainRayActor):
                 attn_implementation=self.args.attn_implementation,
             )
 
+        # Apply LoRA before FSDP wrapping
+        from miles.utils.lora_utils import is_lora_enabled
+
+        if is_lora_enabled(self.args):
+            from peft import get_peft_model
+
+            from miles.utils.lora_utils import get_peft_lora_config
+
+            lora_config = get_peft_lora_config(self.args)
+            model = get_peft_model(model, lora_config)
+            if dist.get_rank() == 0:
+                model.print_trainable_parameters()
+
         model.train()
 
         full_state = model.state_dict()
@@ -112,16 +125,63 @@ class FSDPTrainRayActor(TrainRayActor):
         self.model = model
 
         if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+            if is_lora_enabled(self.args):
+                # For LoRA + FSDP2, use PyTorch's activation checkpointing instead of
+                # HF's gradient_checkpointing_enable(). HF's approach modifies the model's
+                # forward to call torch.utils.checkpoint.checkpoint() which can break the
+                # autograd graph when combined with FSDP2's parameter management.
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    CheckpointImpl,
+                    apply_activation_checkpointing,
+                    checkpoint_wrapper,
+                )
+
+                # Find the decoder layer class to wrap with checkpointing
+                base_model = self.model
+                if hasattr(self.model, "base_model"):
+                    base_model = getattr(self.model.base_model, "model", self.model.base_model)
+
+                layer_cls_name = base_model._no_split_modules[0]
+
+                non_reentrant_wrapper = lambda m: checkpoint_wrapper(
+                    m, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+                )
+
+                apply_activation_checkpointing(
+                    self.model,
+                    checkpoint_wrapper_fn=non_reentrant_wrapper,
+                    check_fn=lambda m: m.__class__.__name__ == layer_cls_name,
+                )
+                logger.info(f"Applied activation checkpointing to {layer_cls_name} layers (LoRA + FSDP2 mode)")
+
+                # PEFT LoRA requires input embeddings to have requires_grad=True
+                # so gradients flow through checkpointed layers
+                if hasattr(self.model, "enable_input_require_grads"):
+                    self.model.enable_input_require_grads()
+            else:
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
 
         if args.optimizer == "adam":
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=args.lr,
-                betas=(args.adam_beta1, args.adam_beta2),
-                eps=args.adam_eps,
-                weight_decay=args.weight_decay,
-            )
+            if is_lora_enabled(self.args):
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                logger.info(f"LoRA optimizer: {len(trainable_params)} trainable parameter groups")
+                self.optimizer = torch.optim.AdamW(
+                    trainable_params,
+                    lr=args.lr,
+                    betas=(args.adam_beta1, args.adam_beta2),
+                    eps=args.adam_eps,
+                    weight_decay=args.weight_decay,
+                )
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=args.lr,
+                    betas=(args.adam_beta1, args.adam_beta2),
+                    eps=args.adam_eps,
+                    weight_decay=args.weight_decay,
+                )
         else:
             raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
 
@@ -272,6 +332,15 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.model.cuda()
         move_torch_optimizer(self.optimizer, "cuda")
+
+        # Restore requires_grad for LoRA parameters after CPU offload
+        from miles.utils.lora_utils import is_lora_enabled
+
+        if is_lora_enabled(self.args) and hasattr(self.model, "base_model"):
+            for name, param in self.model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad_(True)
+
         dist.barrier(group=get_gloo_group())
         print_memory("after wake_up model")
 
@@ -424,6 +493,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
         actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
         rollout_data.update(actor_results)
+
+        # Ensure model is in training mode before the training step
+        self.model.train()
 
         compute_advantages_and_returns(self.args, self.parallel_state, rollout_data)
 
@@ -669,14 +741,24 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None):
 
     offload_policy = CPUOffloadPolicy() if cpu_offload else None
 
-    layer_cls_to_wrap = model._no_split_modules
+    # Handle PEFT-wrapped models where _no_split_modules is on the inner model
+    base_model = model
+    if hasattr(model, "base_model"):
+        base_model = getattr(model.base_model, "model", model.base_model)
+
+    layer_cls_to_wrap = getattr(base_model, "_no_split_modules", None)
+    if layer_cls_to_wrap is None:
+        layer_cls_to_wrap = model._no_split_modules
     assert len(layer_cls_to_wrap) > 0 and layer_cls_to_wrap[0] is not None
+
+    # Use base_model's config for tie_word_embeddings check (handles PEFT wrapping)
+    model_config = getattr(base_model, "config", getattr(model, "config", None))
 
     modules = [
         module
         for name, module in model.named_modules()
         if module.__class__.__name__ in layer_cls_to_wrap
-        or (isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings)
+        or (isinstance(module, torch.nn.Embedding) and not model_config.tie_word_embeddings)
     ]
 
     # Determine precision policy based on args

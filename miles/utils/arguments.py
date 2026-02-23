@@ -1333,6 +1333,81 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_lora_arguments(parser):
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=None,
+                help="LoRA rank. Setting this enables LoRA training.",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=None,
+                help="LoRA scaling alpha. Defaults to 2 * lora_rank if not set.",
+            )
+            parser.add_argument(
+                "--lora-target-modules",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "LoRA target modules. "
+                    "Megatron bridge defaults: linear_qkv linear_proj linear_fc1 linear_fc2; "
+                    "FSDP defaults: q_proj k_proj v_proj o_proj gate_proj up_proj down_proj"
+                ),
+            )
+            parser.add_argument(
+                "--lora-exclude-modules",
+                type=str,
+                nargs="+",
+                default=None,
+                help="Modules to exclude from LoRA adaptation.",
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="LoRA dropout rate.",
+            )
+            parser.add_argument(
+                "--lora-type",
+                type=str,
+                default="lora",
+                choices=["lora", "canonical_lora", "dora"],
+                help="LoRA variant type.",
+            )
+            parser.add_argument(
+                "--lora-a-init-method",
+                type=str,
+                default="kaiming",
+                choices=["kaiming", "xavier"],
+                help="LoRA A matrix initialization method.",
+            )
+            parser.add_argument(
+                "--lora-b-init-method",
+                type=str,
+                default="zero",
+                choices=["zero", "random"],
+                help="LoRA B matrix initialization method.",
+            )
+            parser.add_argument(
+                "--lora-merge-on-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Merge LoRA weights into base before syncing to rollout engines. "
+                    "This avoids adapter-only sync but sends full weights every step."
+                ),
+            )
+            parser.add_argument(
+                "--save-lora-only",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Only save LoRA adapter weights in checkpoints (default: True).",
+            )
+            return parser
+
         def add_ci_arguments(parser):
             parser.add_argument(
                 "--ci-test",
@@ -1404,6 +1479,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
+        parser = add_lora_arguments(parser)
         parser = add_mtp_training_arguments(parser)
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
@@ -1527,6 +1603,28 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def miles_validate_args(args):
+    # LoRA validation
+    args.use_lora = getattr(args, "lora_rank", None) is not None
+    if args.use_lora:
+        if args.train_backend == "megatron":
+            assert args.megatron_to_hf_mode == "bridge", (
+                "LoRA training with Megatron backend requires --megatron-to-hf-mode bridge. "
+                "Raw mode does not support LoRA adapter handling."
+            )
+        if args.lora_alpha is None:
+            args.lora_alpha = 2 * args.lora_rank
+        if args.lora_target_modules is None:
+            from miles.utils.lora_utils import FSDP_DEFAULT_TARGET_MODULES, MEGATRON_DEFAULT_TARGET_MODULES
+
+            if args.train_backend == "megatron":
+                args.lora_target_modules = MEGATRON_DEFAULT_TARGET_MODULES
+            else:
+                args.lora_target_modules = FSDP_DEFAULT_TARGET_MODULES
+        logger.info(
+            f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+            f"type={args.lora_type}, targets={args.lora_target_modules}"
+        )
+
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:

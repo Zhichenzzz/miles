@@ -89,6 +89,11 @@ class UpdateWeightFromDistributed:
                 )
         dist.barrier(group=get_gloo_group())
 
+        # Filter out LoRA adapter params for weight sync (they don't have HF conversion mappings)
+        from miles.utils.lora_utils import is_lora_enabled, is_lora_param
+
+        skip_lora = is_lora_enabled(self.args)
+
         buffer_size = 0
         converted_named_tensors = []
         # non expert params
@@ -96,6 +101,8 @@ class UpdateWeightFromDistributed:
 
         for name, param in named_params_and_buffers(self.args, self.model):
             if ".experts." in name:
+                continue
+            if skip_lora and is_lora_param(name):
                 continue
             buffer_size = self._update_weight_from_distributed(
                 name, param, converted_named_tensors, buffer_size, pbar=pbar
@@ -110,6 +117,8 @@ class UpdateWeightFromDistributed:
         named_tensors = []
         for name, param in named_params_and_buffers(self.args, self.model):
             if ".experts." not in name:
+                continue
+            if skip_lora and is_lora_param(name):
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
                 name, param, named_tensors, buffer_size, pbar=pbar

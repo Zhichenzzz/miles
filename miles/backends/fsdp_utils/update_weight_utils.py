@@ -45,25 +45,105 @@ class UpdateWeight(abc.ABC):
 
     def update_weights(self) -> None:
         self.weight_version += 1
+        self._sync_all_weights()
+
+    def _gather_param(self, param):
+        """Gather a parameter from FSDP shards to a full tensor on GPU."""
+        param = param.cuda()
+        if isinstance(param, DTensor):
+            param = param.redistribute(
+                placements=[Replicate()] * param.device_mesh.ndim,
+                async_op=True,
+            ).to_local()
+        return param
+
+    def _sync_all_weights(self) -> None:
         bucket = []
         bucket_size = 0
-        for name, param in self.model.state_dict().items():
-            param_size = param.numel() * param.element_size()
-            if bucket and bucket_size + param_size >= self.args.update_weight_buffer_size:
-                self.wait_and_update_bucket_weights(bucket)
-                del bucket
-                bucket = []
-                bucket_size = 0
 
-            param = param.cuda()
-            if isinstance(param, DTensor):
-                # async version of param.full_tensor
-                param = param.redistribute(
-                    placements=[Replicate()] * param.device_mesh.ndim,
-                    async_op=True,
-                ).to_local()
-            bucket.append((name, param))
-            bucket_size += param_size
+        from miles.utils.lora_utils import is_lora_enabled, is_lora_param
+
+        lora_enabled = is_lora_enabled(self.args) and hasattr(self.model, "base_model")
+
+        if lora_enabled:
+            state_items = list(self.model.state_dict().items())
+            # Collect LoRA weights (gathered to full tensors) keyed by their base param path
+            # e.g., "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+            lora_weights = {}
+            for name, param in state_items:
+                if is_lora_param(name):
+                    param = self._gather_param(param)
+                    if hasattr(param, "wait"):
+                        param = param.wait()
+                    lora_weights[name] = param
+
+            # Get LoRA scaling factor
+            scaling = {}
+            for module_name, module in self.model.named_modules():
+                if hasattr(module, "scaling"):
+                    s = module.scaling
+                    if isinstance(s, dict):
+                        scaling[module_name] = s.get("default", 1.0)
+                    else:
+                        scaling[module_name] = float(s)
+
+            # Iterate base params and merge LoRA where applicable
+            for name, param in state_items:
+                if is_lora_param(name):
+                    continue
+
+                param_size = param.numel() * param.element_size()
+                if bucket and bucket_size + param_size >= self.args.update_weight_buffer_size:
+                    self.wait_and_update_bucket_weights(bucket)
+                    del bucket
+                    bucket = []
+                    bucket_size = 0
+
+                param = self._gather_param(param)
+
+                # Check if this base param has LoRA adapters to merge.
+                # PEFT state_dict keys:
+                #   base weight: "base_model.model.{path}.q_proj.base_layer.weight"
+                #   lora_A:      "base_model.model.{path}.q_proj.lora_A.default.weight"
+                # We must strip ".base_layer" from the base weight key to match LoRA keys.
+                base_key = name.replace(".base_layer.", ".")
+                lora_a_key = base_key.replace(".weight", ".lora_A.default.weight")
+                lora_b_key = base_key.replace(".weight", ".lora_B.default.weight")
+                if lora_a_key in lora_weights and lora_b_key in lora_weights:
+                    # Wait for async gather if needed
+                    if hasattr(param, "wait"):
+                        param = param.wait()
+                    lora_a = lora_weights[lora_a_key]
+                    lora_b = lora_weights[lora_b_key]
+                    # Find scaling: module path in named_modules() doesn't have ".base_layer"
+                    module_path = base_key.rsplit(".weight", 1)[0]
+                    scale = scaling.get(module_path, 1.0)
+                    # Merge: W_merged = W_base + B @ A * scaling
+                    param = param + (lora_b @ lora_a) * scale
+
+                # Strip PEFT prefixes for SGLang:
+                #   "base_model.model.xxx" -> "xxx"
+                #   "q_proj.base_layer.weight" -> "q_proj.weight"
+                clean_name = name
+                if clean_name.startswith("base_model.model."):
+                    clean_name = clean_name[len("base_model.model."):]
+                clean_name = clean_name.replace(".base_layer.", ".")
+
+                bucket.append((clean_name, param))
+                bucket_size += param_size
+        else:
+            state_items = self.model.state_dict().items()
+            for name, param in state_items:
+                param_size = param.numel() * param.element_size()
+                if bucket and bucket_size + param_size >= self.args.update_weight_buffer_size:
+                    self.wait_and_update_bucket_weights(bucket)
+                    del bucket
+                    bucket = []
+                    bucket_size = 0
+
+                param = self._gather_param(param)
+                bucket.append((name, param))
+                bucket_size += param_size
 
         if bucket:
             self.wait_and_update_bucket_weights(bucket)

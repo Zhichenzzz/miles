@@ -20,7 +20,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
     def get_hf_weight_chunks(self, megatron_local_weights):
         # TODO support quantization (e.g. modify megatron-bridge to provide megatron param name)
-        renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
+        # Filter out LoRA adapter params - they don't have conversion tasks and are
+        # handled by the bridge during export_hf_weights (merged automatically)
+        from miles.utils.lora_utils import is_lora_param
+
+        renamed_megatron_local_weights = {
+            strip_param_name_prefix(k): v for k, v in megatron_local_weights.items() if not is_lora_param(k)
+        }
         with megatron_bridge_utils.patch_megatron_model(self.model):
             conversion_tasks = self._bridge.get_conversion_tasks(self.model)
             conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)

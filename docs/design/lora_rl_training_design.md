@@ -1,5 +1,18 @@
 # Miles LoRA RL Training Framework Design
 
+## 终极目标（必须达成）
+
+在 miles 框架内完成 LoRA RL 训练闭环，确保 **FSDP** 与 **Megatron bridge** 两个后端都可稳定运行、可复现，并在 AIME 2025 评测上相对 baseline 明确涨分且符合预期表现。
+
+执行上以以下两个脚本为唯一主入口，持续调参直至目标达成：
+- `/opt/tiger/miles/examples/lora/run-qwen3-8B-aime-fsdp-lora.sh`
+- `/opt/tiger/miles/examples/lora/run-qwen3-8B-aime-megatron-lora.sh`
+
+达标条件：
+- 两个后端均能端到端完成训练与评估（无阻塞性报错，checkpoint 可保存/恢复）。
+- 两个后端在同一评测口径下均较 baseline（约 15-20%）取得显著提升。
+- FSDP 与 Megatron 的最终精度差异控制在可接受范围（目标 < 2%）。
+
 ## Context
 
 Miles 框架当前只支持全参数 RL 训练，不支持 LoRA/PEFT 参数高效训练。参考 [verl 的 LoRA 设计](https://github.com/verl-project/verl/blob/main/examples/grpo_trainer/run_qwen3moe-30b_megatron_lora.sh)，为 miles 添加 LoRA RL 训练支持，覆盖 Megatron (bridge mode) 和 FSDP 两个训练后端。
@@ -918,3 +931,116 @@ python -m miles.pipeline.run \
 4. **Weight Sync**: adapter-only sync 后推理结果与合并权重一致
 5. **Checkpoint**: 保存 → 加载 → 验证训练可继续
 6. **Ref 模型**: KL divergence 计算正确
+
+---
+
+## 持续调参执行规范（AIME 2025）
+
+调参过程中，默认只修改并迭代这两个脚本中的参数组合，不引入新的实验入口：
+- `/opt/tiger/miles/examples/lora/run-qwen3-8B-aime-fsdp-lora.sh`
+- `/opt/tiger/miles/examples/lora/run-qwen3-8B-aime-megatron-lora.sh`
+
+每轮迭代至少记录以下指标并与上一轮对比：
+1. AIME 2025 pass@1（主指标）
+2. 训练 reward 曲线趋势（是否稳定上升）
+3. 吞吐与显存（tokens/sec/GPU、峰值显存）
+4. 训练稳定性（是否出现 NaN、OOM、发散、卡死）
+
+调参优先级建议：
+1. 批大小与采样相关：`rollout-batch-size`、`n-samples-per-prompt`、`global-batch-size`
+2. RL 稳定性相关：`kl-loss-coef`、`eps-clip`、`eps-clip-high`、`entropy-coef`
+3. LoRA 容量相关：`lora-rank`、`lora-alpha`、`lora-dropout`
+4. 性能相关：`max-tokens-per-gpu`、`sglang-mem-fraction-static`、重计算与并行参数
+
+---
+
+## Qwen3-8B AIME 2025 性能测试计划
+
+### 测试目标
+
+验证 Miles LoRA RL 训练在竞赛数学场景 (AIME 2025) 下的效果，对比 FSDP 和 Megatron 两个后端。
+
+### 测试矩阵
+
+| 实验 | 模型 | 后端 | 训练数据 | 评估数据 | 脚本 | 状态 |
+|------|------|------|----------|----------|------|------|
+| Baseline | Qwen3-8B | - | - | AIME 2025 | - | 待测 |
+| FSDP LoRA | Qwen3-8B | FSDP | MATH L3-5 | AIME 2025 | `run-qwen3-8B-aime-fsdp-lora.sh` | 待测 |
+| Megatron LoRA | Qwen3-8B | Megatron bridge | MATH L3-5 | AIME 2025 | `run-qwen3-8B-aime-megatron-lora.sh` | 待测 |
+
+### 实验配置
+
+#### 统一超参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| LoRA rank | 64 | 适中的 adapter 容量 |
+| LoRA alpha | 32 | alpha / rank = 0.5 |
+| 训练数据 | MATH level 3-5 | ~9K 竞赛数学题 |
+| 评估数据 | AIME 2025 | 30 道整数答案题 (0-999) |
+| Learning rate | 3e-6 | 恒定学习率 |
+| Rollout batch size | 16 | 每批采样 16 个 prompt |
+| Samples per prompt | 8 | 每个 prompt 采 8 条 |
+| Max response length | 8192 (train) / 16384 (eval) | 允许长链式推理 |
+| Global batch size | 128 | GRPO 训练批大小 |
+| Advantage estimator | GRPO | Group Relative Policy Optimization |
+| KL loss | low_var_kl, coef=0.001 | 防止策略偏移过大 |
+| Reward model | math (boxed answer extraction) | SymPy 等价性检查 |
+| Save interval | 20 rollouts | |
+| Eval interval | 10 rollouts | |
+
+#### 后端差异
+
+| 参数 | FSDP | Megatron Bridge |
+|------|------|-----------------|
+| `--train-backend` | fsdp | megatron |
+| `--megatron-to-hf-mode` | - | bridge |
+| `--tensor-model-parallel-size` | - | 1 |
+| `--pipeline-model-parallel-size` | - | 1 |
+| `--seq-length` | - | 8192 |
+| `--attention-backend` | flash_attention_2 | flash |
+| Gradient checkpointing | `--gradient-checkpointing` | `--recompute-granularity full` |
+| Model args | 自动 (HF config) | `scripts/models/qwen3-8B.sh` |
+| LoRA target modules | q/k/v/o/gate/up/down_proj | linear_qkv/proj/fc1/fc2 |
+
+### 数据准备
+
+```bash
+# 准备 MATH level 3-5 训练数据和 AIME 2025 评估数据
+python examples/lora/prepare_math_aime_data.py ${DATA_DIR}
+```
+
+输出:
+- `${DATA_DIR}/math_level3to5/train.jsonl` (~9K 条)
+- `${DATA_DIR}/aime2025/aime2025.jsonl` (30 条)
+
+### 运行步骤
+
+```bash
+# Step 1: 准备数据
+export DATA_DIR="/root/data"
+python examples/lora/prepare_math_aime_data.py ${DATA_DIR}
+
+# Step 2a: FSDP LoRA 训练
+NUM_GPUS=2 bash examples/lora/run-qwen3-8B-aime-fsdp-lora.sh
+
+# Step 2b: Megatron LoRA 训练
+NUM_GPUS=2 bash examples/lora/run-qwen3-8B-aime-megatron-lora.sh
+```
+
+### 预期结果
+
+| 指标 | Baseline | FSDP LoRA | Megatron LoRA |
+|------|----------|-----------|---------------|
+| AIME 2025 (pass@1) | ~15-20% | ~25-35% | ~25-35% |
+| 训练 reward 曲线 | - | 单调上升 | 单调上升 |
+| FSDP vs Megatron 精度差异 | - | - | < 2% |
+
+### 关注指标
+
+1. **AIME 2025 pass@1**: 训练前后在 30 道 AIME 题上的正确率
+2. **训练 reward 曲线**: MATH 数据集上的平均 reward 是否单调上升
+3. **训练吞吐量**: tokens/sec/GPU，两个后端的对比
+4. **显存占用**: 峰值 GPU 显存，LoRA vs full-param 的节省比例
+5. **收敛速度**: 达到最优 AIME 性能所需的 rollout 数
+6. **FSDP vs Megatron 一致性**: 两个后端训练后模型在同一评估集上的性能差异

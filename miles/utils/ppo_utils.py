@@ -150,13 +150,22 @@ def compute_policy_loss(
 
 
 def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
-    # TODO: when megatron is not installed, fall back to naive implementation
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    try:
+        from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
-    # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
-    logits = logits.unsqueeze(1)
-    tokens = tokens.unsqueeze(1)
-    return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
+        # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
+        logits = logits.unsqueeze(1)
+        tokens = tokens.unsqueeze(1)
+        return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
+    except ImportError:
+        # Fallback when megatron is not installed (e.g. FSDP backend)
+        return _compute_log_probs_naive(logits, tokens)
+
+
+def _compute_log_probs_naive(logits: torch.Tensor, tokens: torch.Tensor):
+    """Naive log-prob computation without megatron fused kernel."""
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    return log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
 
 
 # from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99

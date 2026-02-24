@@ -1,27 +1,37 @@
 #!/bin/bash
 #
 # LoRA GRPO Training for Qwen3-8B on MATH level 3-5, evaluated on AIME 2025
+# Backend: Megatron (bridge mode)
 #
 # Model: Qwen3-8B (8.2B dense, post-trained with thinking mode)
 # Training data: MATH (Hendrycks) level 3-5 (~9K competition math problems)
 # Eval: AIME 2025 (30 competition math problems, integer answers 0-999)
 # LoRA: rank=64, alpha=32
-# Hardware: 8x GPU (4 training + 4 inference, non-colocated)
-# Backend: FSDP
+# Hardware: 8x GPU (colocated mode)
+# Backend: Megatron bridge mode (required for LoRA + Megatron)
 #
-# Expected: AIME 2025 baseline ~15-20% → improved with GRPO RL
+# Requirements:
+#   - megatron-bridge >= 0.2.0 (with megatron.bridge.peft support)
+#   - Megatron-LM installed
+#
+# Expected: AIME 2025 baseline ~15-20% -> improved with GRPO RL
 #
 
 set -ex
 
 export PYTHONBUFFERED=16
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-8B.sh"
+
 DATA_DIR=${DATA_DIR:-"/root/data"}
-SAVE_DIR=${SAVE_DIR:-"/root/data/checkpoints/qwen3-8b-aime-fsdp-lora"}
+SAVE_DIR=${SAVE_DIR:-"/root/data/checkpoints/qwen3-8b-aime-megatron-lora"}
 NUM_GPUS=${NUM_GPUS:-2}
 
 CKPT_ARGS=(
    --hf-checkpoint "${DATA_DIR}/Qwen3-8B"
+   # Use HF checkpoint directly for LoRA (torch_dist format causes sharded state dict mismatch
+   # because LoRA adapter keys don't exist in the base checkpoint)
    --load "${DATA_DIR}/Qwen3-8B"
    --ref-load "${DATA_DIR}/Qwen3-8B"
    --save "${SAVE_DIR}"
@@ -31,7 +41,11 @@ CKPT_ARGS=(
 LORA_ARGS=(
    --lora-rank 64
    --lora-alpha 32
+   # Default Megatron target modules: linear_qkv,linear_proj,linear_fc1,linear_fc2
    --lora-dropout 0.0
+   --lora-type lora
+   --lora-a-init-method kaiming
+   --lora-b-init-method zero
    --save-lora-only
 )
 
@@ -47,7 +61,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 16
    --n-samples-per-prompt 6
    --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-   --rollout-max-response-len 6144
+   --rollout-max-response-len 8192
    --rollout-temperature 0.7
    --global-batch-size 96
 )
@@ -82,26 +96,35 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    # --use-wandb
    # --wandb-project miles-lora-aime
-   # --wandb-group qwen3-8b-fsdp-lora
+   # --wandb-group qwen3-8b-megatron-lora
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.60
+   --sglang-mem-fraction-static 0.80
    --sglang-decode-log-interval 1000
 )
 
 TRAIN_BACKEND_ARGS=(
-   --train-backend fsdp
+   --train-backend megatron
+   --megatron-to-hf-mode bridge
    --update-weight-buffer-size 536870912
-   --gradient-checkpointing
-   --attn-implementation flash_attention_2
-   --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
+   --attention-backend flash
+   --tensor-model-parallel-size 1
+   --pipeline-model-parallel-size 1
+   --seq-length 8192
+   --max-position-embeddings 32768
+   --tokenizer-type NullTokenizer
+   --tokenizer-model "${DATA_DIR}/Qwen3-8B"
+   --bf16
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
 )
 
 PERF_ARGS=(
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 1024
+   --max-tokens-per-gpu 8192
 )
 
 MISC_ARGS=(
@@ -116,18 +139,17 @@ export RAY_PORT=${RAY_PORT:-6399}
 export RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8266}
 ray start --head --node-ip-address ${MASTER_ADDR} --port ${RAY_PORT} --dashboard-port ${RAY_DASHBOARD_PORT} --num-gpus "${NUM_GPUS}" --disable-usage-stats
 
-MEGATRON_PATH=${MEGATRON_PATH:-"/opt/tiger/shard_train/Megatron-LM"}
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"${MEGATRON_PATH}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
   }
 }"
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   --no-wait \
    -- python3 train.py \
+   "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${LORA_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

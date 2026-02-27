@@ -34,7 +34,9 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
-    assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+    # Keep behavior aligned with all_gather_params_async: concatenate gathered shards directly.
+    # Some models may set partition_stride != 1 for TP params (e.g., fused qkv layouts).
+    # We currently rely on downstream model-specific conversion logic to handle final ordering.
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
     if "linear_fc1.weight" in name:

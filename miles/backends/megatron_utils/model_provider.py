@@ -150,8 +150,14 @@ def get_model_provider_func(
             if peft_cls is not None:
                 original_provide = provider.provide
 
-                def provide_with_lora(pre_process=None, post_process=None, vp_stage=None):
-                    model = original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                def provide_with_lora(pre_process=None, post_process=None, vp_stage=None, **kwargs):
+                    # Megatron-Core may pass extra kwargs (e.g. config). Bridge provider's
+                    # provide() doesn't accept them, so we intentionally ignore unknown kwargs.
+                    model = original_provide(
+                        pre_process=pre_process,
+                        post_process=post_process,
+                        vp_stage=vp_stage,
+                    )
                     # Apply LoRA to the model (freezes base params, adds adapter params)
                     model = peft_cls(model, training=True)
                     peft_cls.set_params_to_save(model)

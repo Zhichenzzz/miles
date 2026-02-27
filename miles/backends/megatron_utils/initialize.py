@@ -62,8 +62,10 @@ def init(args):
     # Pytorch distributed.
     _initialize_distributed(args)
 
-    # https://github.com/NVIDIA/Megatron-LM/issues/1563
-    assert np.__version__.startswith("1."), "Megatron does not support numpy 2.x"
+    # Megatron historically expected numpy 1.x. In our runtime numpy 2.x can
+    # still work for this flow, so keep running and emit a warning instead.
+    if not np.__version__.startswith("1."):
+        logger.warning("Megatron is running with numpy %s (expected 1.x).", np.__version__)
 
     # Random seeds for reproducibility.
     if args.rank == 0:

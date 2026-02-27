@@ -16,8 +16,8 @@ set -ex
 
 export PYTHONBUFFERED=16
 
-DATA_DIR=${DATA_DIR:-"/root/data"}
-SAVE_DIR=${SAVE_DIR:-"/root/data/checkpoints/qwen3-8b-aime-fsdp-lora"}
+DATA_DIR=${DATA_DIR:-"/opt/tiger/shard_train/data"}
+SAVE_DIR=${SAVE_DIR:-"/opt/tiger/shard_train/data/checkpoints/qwen3-8b-aime-fsdp-lora"}
 NUM_GPUS=${NUM_GPUS:-2}
 
 CKPT_ARGS=(
@@ -114,7 +114,11 @@ MISC_ARGS=(
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export RAY_PORT=${RAY_PORT:-6399}
 export RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8266}
-ray start --head --node-ip-address ${MASTER_ADDR} --port ${RAY_PORT} --dashboard-port ${RAY_DASHBOARD_PORT} --num-gpus "${NUM_GPUS}" --disable-usage-stats
+if curl -fsS "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/version" >/dev/null 2>&1; then
+   echo "Reusing existing Ray cluster at http://127.0.0.1:${RAY_DASHBOARD_PORT}"
+else
+   ray start --head --node-ip-address ${MASTER_ADDR} --port ${RAY_PORT} --dashboard-port ${RAY_DASHBOARD_PORT} --num-gpus "${NUM_GPUS}" --disable-usage-stats
+fi
 
 MEGATRON_PATH=${MEGATRON_PATH:-"/opt/tiger/shard_train/Megatron-LM"}
 RUNTIME_ENV_JSON="{
@@ -124,7 +128,9 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+SUBMISSION_ID="fsdp-lora-$(date +%Y%m%d-%H%M%S)"
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+   --submission-id "${SUBMISSION_ID}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    --no-wait \
    -- python3 train.py \

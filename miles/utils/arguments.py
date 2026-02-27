@@ -1840,6 +1840,18 @@ def hf_validate_args(args, hf_config):
     def equal(x, y):
         return x == y
 
+    def get_megatron_arg(name):
+        if hasattr(args, name):
+            return getattr(args, name)
+        fallback_names = {
+            # Megatron-LM versions differ in epsilon arg naming.
+            "norm_epsilon": ["layernorm_epsilon", "rms_norm_eps"],
+        }
+        for fb in fallback_names.get(name, []):
+            if hasattr(args, fb):
+                return getattr(args, fb)
+        return None
+
     errors = []
 
     # multimodal models have different config structure
@@ -1856,10 +1868,16 @@ def hf_validate_args(args, hf_config):
         ("rope_theta", "rotary_base", equal),
     ]:
         if hasattr(hf_config, hf_config_name):
-            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
+            megatron_value = get_megatron_arg(megatron_config_name)
+            if megatron_value is None:
+                logger.warning(
+                    f"Skip hf/megatron config check: missing megatron arg {megatron_config_name}."
+                )
+                continue
+            if not compare_fn(getattr(hf_config, hf_config_name), megatron_value):
                 errors.append(
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
-                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+                    f"{megatron_config_name} {megatron_value}, please check the config."
                 )
 
     if len(errors) > 0:

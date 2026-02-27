@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
 import torch
 
 _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
+_TP_ATTR_KEYS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
 
 
 class TensorBackuper(ABC):
@@ -57,6 +58,7 @@ class _TensorBackuperNormal(TensorBackuper):
         for name, param in self._source_getter():
             if name not in backup_dict:
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+            _copy_tensor_attrs(src=param, dst=backup_dict[name])
             backup_dict[name].copy_(param.detach(), non_blocking=True)
         torch.cuda.synchronize()
 
@@ -72,6 +74,12 @@ class _TensorBackuperNormal(TensorBackuper):
             assert name in backup_dict
             param.copy_(backup_dict[name], non_blocking=True)
         torch.cuda.synchronize()
+
+
+def _copy_tensor_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
+    for key in _TP_ATTR_KEYS:
+        if hasattr(src, key):
+            setattr(dst, key, getattr(src, key))
 
 
 class _TensorBackuperNoop(TensorBackuper):

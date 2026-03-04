@@ -1,0 +1,4 @@
+interface:
+  display_name: "Miles Agentic RL Pipeline 中文版"
+  short_description: "用中文分析、排障并实现 Miles Agentic RL 全链路流程"
+  default_prompt: "请阅读 Miles 代码和文档，用中文解释或实现从 rollout 到优化更新的 agentic RL 训练流水线。"

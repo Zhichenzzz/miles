@@ -1,0 +1,4 @@
+interface:
+  display_name: "Miles Agentic RL Pipeline"
+  short_description: "Map and run Miles agentic RL workflows"
+  default_prompt: "Read Miles code/docs and explain or implement the agentic RL training pipeline from rollout to optimization."

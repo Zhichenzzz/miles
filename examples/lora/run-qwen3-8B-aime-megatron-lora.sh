@@ -29,6 +29,15 @@ SAVE_DIR=${SAVE_DIR:-"/opt/tiger/shard_train/data/checkpoints/qwen3-8b-aime-mega
 NUM_GPUS=${NUM_GPUS:-8}
 MEGATRON_PATH=${MEGATRON_PATH:-"/opt/tiger/shard_train/Megatron-LM"}
 HF_CKPT_DIR=${HF_CKPT_DIR:-"${DATA_DIR}/Qwen3-8B"}
+# Stable defaults tuned for anti-regression:
+# keep long training horizon, but reduce per-rollout update aggressiveness.
+NUM_ROLLOUT=${NUM_ROLLOUT:-100}
+SAVE_INTERVAL=${SAVE_INTERVAL:-10}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-6}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.7}
+KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
+LR=${LR:-2e-6}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-24}
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT_DIR}"
@@ -36,7 +45,7 @@ CKPT_ARGS=(
    --load "${HF_CKPT_DIR}"
    --ref-load "${HF_CKPT_DIR}"
    --save "${SAVE_DIR}"
-   --save-interval 10
+   --save-interval "${SAVE_INTERVAL}"
 )
 
 LORA_ARGS=(
@@ -59,18 +68,18 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --balance-data
    --rm-type math
-   --num-rollout 100
+   --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size 4
-   --n-samples-per-prompt 8
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
    --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    # Keep generations bounded to reduce late-token degeneration.
    --rollout-max-response-len 8192
-   --rollout-temperature 0.8
-   --rollout-top-p 0.95
+   --rollout-temperature "${ROLLOUT_TEMPERATURE}"
+   --rollout-top-p 0.90
    --rollout-top-k 20
    # Qwen3 eos tokens: <|im_end|>=151645, <|endoftext|>=151643.
    --rollout-stop-token-ids 151645 151643
-   --global-batch-size 12
+   --global-batch-size "${GLOBAL_BATCH_SIZE}"
 )
 
 EVAL_ARGS=(
@@ -84,16 +93,16 @@ EVAL_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.0005
+   --kl-loss-coef "${KL_LOSS_COEF}"
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --eps-clip 0.2
-   --eps-clip-high 0.28
+   --eps-clip 0.18
+   --eps-clip-high 0.24
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 5e-6
+   --lr "${LR}"
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -137,6 +146,7 @@ PERF_ARGS=(
 MISC_ARGS=(
    --actor-num-nodes 1
    --actor-num-gpus-per-node "${NUM_GPUS}"
+   --rollout-num-gpus "${NUM_GPUS}"
    --colocate
    --no-offload-train
    --train-memory-margin-bytes 0
